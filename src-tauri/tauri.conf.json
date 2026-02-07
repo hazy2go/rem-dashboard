@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Rem Dashboard",
+  "version": "1.0.0",
+  "identifier": "ai.rem.dashboard",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:3000"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Rem Dashboard",
+        "width": 1280,
+        "height": 720,
+        "resizable": false,
+        "fullscreen": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
