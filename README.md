@@ -1,89 +1,84 @@
 # Rem Dashboard
 
-A React-based dashboard interface for Rem, designed for 800x480 displays with fullscreen support.
+A native Tauri dashboard for monitoring [OpenClaw](https://github.com/openclaw/openclaw) AI assistants. Designed for small displays (5-inch / 1280×720) on always-on setups like Mac Mini.
+
+![Rem Dashboard Screenshot](screenshot.png)
 
 ## Features
 
-- 🌸 Beautiful petal-based token usage visualization
-- 🤖 Real-time agent status monitoring
-- ⏰ Cron job management interface
-- 📋 Activity feed with color-coded logs
-- 🫧 Sub-agent status tracking
-- 📊 System metrics display
+- 🌸 **Token Usage** — Petal visualization for 5-hour and weekly Claude Max limits
+- 🤖 **Agent Status** — Real-time primary agent activity with auto-detection
+- ⏰ **Cron Jobs** — View launchd scheduled tasks with next run times
+- 📋 **Activity Feed** — Color-coded logs via Server-Sent Events (SSE)
+- 🫧 **Sub-Agents** — Track spawned background sessions
+- 📊 **System Metrics** — Uptime, memory pressure, load average
 
-## Development
+## Quick Start
 
 ### Prerequisites
 
-- Node.js (v18 or higher)
-- npm
+- Node.js 18+
+- Rust (for Tauri)
+- macOS (uses launchd, CodexBar)
 
-### Installation
-
-Dependencies are already installed. If you need to reinstall:
+### Install & Run
 
 ```bash
+# Install frontend dependencies
 npm install
+
+# Install server dependencies
+cd server && npm install && cd ..
+
+# Start API server (port 3001)
+node server/api.js &
+
+# Run in dev mode
+npm run tauri:dev
 ```
 
-### Running the Development Server
+### Build for Production
 
 ```bash
-# Standard development server
-npm run dev
+npm run tauri:build
 ```
 
-The dashboard will be available at `http://localhost:3000`
+The app bundle will be in `src-tauri/target/release/bundle/`.
 
-### Kiosk Mode (Full Screen)
+## API Server
 
-For 800x480 displays, use the provided shell script:
+The dashboard requires a local API server that:
+- Scans OpenClaw session logs for usage data
+- Watches session transcripts for auto-activity detection
+- Exposes SSE endpoint for real-time updates
 
 ```bash
-./start-dashboard.sh
+# Log activity from scripts
+curl -X POST localhost:3001/api/activity \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"REM","message":"Task done","type":"success"}'
 ```
-
-This script will:
-- Start the Vite dev server
-- Launch Chrome in kiosk mode at 800x480 resolution
-- Automatically stop the dev server when Chrome is closed
 
 ## Configuration
 
-The dashboard is configured for:
-- **Display Size**: 800x480 pixels
-- **No scrollbars**: Overflow hidden for fullscreen experience
-- **Responsive design**: Optimized for the target display size
-- **Google Fonts**: Quicksand and Comfortaa loaded via CDN
+The dashboard reads from:
+- `~/.openclaw/agents/main/sessions/*.jsonl` — Session transcripts
+- CodexBar CLI — Claude Max usage data
+- launchd — Cron job schedules
 
 ## Project Structure
 
 ```
 rem-dashboard/
-├── src/
-│   ├── main.jsx           # Entry point
-│   ├── App.jsx            # Main app component
-│   └── rem-dashboard.jsx  # Dashboard component (copied from rem-face)
-├── public/
-│   └── vite.svg          # Favicon
-├── index.html            # HTML template (configured for fullscreen)
-├── package.json          # Dependencies and scripts
-├── vite.config.js        # Vite configuration
-├── start-dashboard.sh    # Kiosk mode launcher script
-└── README.md            # This file
+├── src/                    # React frontend
+│   └── rem-dashboard.jsx   # Main dashboard component
+├── src-tauri/              # Rust/Tauri backend
+├── server/                 # Node.js API server
+│   ├── api.js              # Express server + SSE
+│   └── usage-scanner.js    # OpenClaw log parser
+└── start-dashboard.sh      # Launch script
 ```
 
-## Build for Production
+## License
 
-```bash
-npm run build
-```
-
-Built files will be in the `dist/` directory.
-
-## Notes
-
-- The dashboard component maintains its original design from `rem-face`
-- All visual styling and mock data are preserved
-- Fonts (Quicksand, Comfortaa) are loaded via Google Fonts CDN as specified in the original component
-- No modifications were made to the visual design, only project structure setup
+MIT
