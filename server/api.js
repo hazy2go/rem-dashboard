@@ -3,7 +3,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { exec } = require('child_process');
 const { getTodayUsage, getWeeklyUsage } = require('./usage-scanner');
 
 // ── Auto-detect Rem activity from session transcript ──────────────────
@@ -206,52 +206,6 @@ function getClaudeUsage() {
   return cachedClaudeUsage;
 }
 
-// Get OpenClaw context window usage from session files
-function getContextUsage() {
-  try {
-    // Read sessions.json to find main session
-    const sessionsPath = path.join(os.homedir(), '.openclaw/agents/main/sessions/sessions.json');
-    const sessions = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
-    const mainSession = sessions['agent:main:main'];
-    
-    if (!mainSession) return { contextUsed: 0, contextLimit: 200000, contextPercent: 0, model: 'claude-opus-4-5' };
-    
-    // Read the transcript to get last usage
-    const transcriptPath = path.join(os.homedir(), '.openclaw/agents/main/sessions', mainSession.sessionId + '.jsonl');
-    if (!fs.existsSync(transcriptPath)) return { contextUsed: 0, contextLimit: 200000, contextPercent: 0, model: 'claude-opus-4-5' };
-    
-    // Read last few lines for usage
-    const content = fs.readFileSync(transcriptPath, 'utf8');
-    const lines = content.trim().split('\n').slice(-20);
-    
-    let lastUsage = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const obj = JSON.parse(lines[i]);
-        if (obj.message?.usage?.totalTokens) {
-          lastUsage = obj.message.usage;
-          break;
-        }
-      } catch (e) {}
-    }
-    
-    // Calculate context from usage - input + cacheRead is roughly the context
-    const contextUsed = lastUsage ? (lastUsage.input || 0) + (lastUsage.cacheRead || 0) + (lastUsage.cacheWrite || 0) + (lastUsage.output || 0) : 0;
-    const contextLimit = 200000;
-    const contextPercent = Math.round((contextUsed / contextLimit) * 100);
-    
-    return {
-      contextUsed,
-      contextLimit,
-      contextPercent,
-      model: 'claude-opus-4-5'
-    };
-  } catch (e) {
-    console.error('Error reading context:', e.message);
-    return { contextUsed: 0, contextLimit: 200000, contextPercent: 0, model: 'claude-opus-4-5' };
-  }
-}
-
 // Cached sub-agents
 let cachedSubAgents = [];
 let lastSubAgentUpdate = 0;
@@ -328,7 +282,6 @@ app.use(express.json());
 
 // Data file paths
 const ACTIVITY_FILE = path.join(os.homedir(), '.openclaw/workspace/rem-activity.json');
-const TOKENS_FILE = path.join(os.homedir(), '.openclaw/workspace/rem-tokens.json');
 const AGENT_STATE_FILE = path.join(os.homedir(), '.openclaw/workspace/rem-agent-state.json');
 
 // Read agent state
@@ -409,11 +362,11 @@ app.post('/api/agent', (req, res) => {
 
 // SSE endpoint for real-time updates
 app.get('/api/events', (req, res) => {
+  // CORS is handled by the cors() middleware — no manual header needed
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': 'http://localhost:3000',
   });
   
   // Send initial connection message
@@ -506,89 +459,78 @@ function getSystemStats() {
 // Cached cron jobs (refresh separately to avoid blocking)
 let cachedCronJobs = [];
 let lastCronUpdate = 0;
+let cronRefreshInFlight = false;
 
-// Helper function to get OpenClaw cron jobs
-function getCronJobs(forceRefresh = false) {
+// launchd job definitions
+const LAUNCHD_JOBS = [
+  { id: 'video-mirror', name: 'video-mirror', schedule: 'Every 5m', label: 'com.openclaw.video-mirror', intervalMs: 5 * 60 * 1000 },
+  { id: 'qmd-update', name: 'qmd-update', schedule: 'Every 5m', label: 'com.openclaw.qmd-update', intervalMs: 5 * 60 * 1000 },
+  { id: 'daily-backup', name: 'daily-backup', schedule: '4:00 AM', label: 'com.openclaw.daily-backup', calendarHour: 4 },
+  { id: 'memory-cleanup', name: 'memory-cleanup', schedule: 'Every 6h', label: 'com.openclaw.memory-cleanup', calendarHours: [0, 6, 12, 18] }
+];
+
+// Build jobs list from launchctl output (pure, no I/O)
+function buildCronJobs(launchctlOutput) {
   const now = Date.now();
-  if (forceRefresh || now - lastCronUpdate > 5000) {
-    lastCronUpdate = now;
-    
-    // Define our launchd jobs with interval info for calculating next run
-    const launchdJobs = [
-      { id: 'video-mirror', name: 'video-mirror', schedule: 'Every 5m', label: 'com.openclaw.video-mirror', intervalMs: 5 * 60 * 1000 },
-      { id: 'qmd-update', name: 'qmd-update', schedule: 'Every 5m', label: 'com.openclaw.qmd-update', intervalMs: 5 * 60 * 1000 },
-      { id: 'daily-backup', name: 'daily-backup', schedule: '4:00 AM', label: 'com.openclaw.daily-backup', calendarHour: 4 },
-      { id: 'memory-cleanup', name: 'memory-cleanup', schedule: 'Every 6h', label: 'com.openclaw.memory-cleanup', calendarHours: [0, 6, 12, 18] }
-    ];
-    
-    const jobs = [];
-    const formatTime = (d) => d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-    
+  const nowDate = new Date();
+  const formatTime = (d) => d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const jobs = [];
+
+  for (const job of LAUNCHD_JOBS) {
+    const isLoaded = launchctlOutput.includes(job.label);
+
+    let lastRun = '—';
+    let lastRunMs = null;
+    const logFile = `/tmp/${job.id}.log`;
     try {
-      // Get launchd status
-      const launchctlOutput = execSync('launchctl list 2>/dev/null || true', { encoding: 'utf8' });
-      
-      for (const job of launchdJobs) {
-        // Check if job is loaded in launchd
-        const isLoaded = launchctlOutput.includes(job.label);
-        
-        // Check log file for last run time
-        let lastRun = '—';
-        let lastRunMs = null;
-        const logFile = `/tmp/${job.id}.log`;
-        try {
-          if (fs.existsSync(logFile)) {
-            const stat = fs.statSync(logFile);
-            lastRunMs = stat.mtime.getTime();
-            lastRun = formatTime(stat.mtime);
-          }
-        } catch (e) {}
-        
-        // Calculate next run time
-        let nextRun = '—';
-        const nowDate = new Date();
-        
-        if (job.intervalMs && lastRunMs) {
-          // Interval-based: next = last + interval
-          const nextMs = lastRunMs + job.intervalMs;
-          if (nextMs > now) {
-            nextRun = formatTime(new Date(nextMs));
-          } else {
-            // Overdue, next run is basically now
-            nextRun = 'soon';
-          }
-        } else if (job.calendarHour !== undefined) {
-          // Daily at specific hour
-          const next = new Date(nowDate);
-          next.setHours(job.calendarHour, 0, 0, 0);
-          if (next <= nowDate) next.setDate(next.getDate() + 1);
-          nextRun = formatTime(next);
-        } else if (job.calendarHours) {
-          // Multiple times per day
-          const currentHour = nowDate.getHours();
-          const nextHour = job.calendarHours.find(h => h > currentHour) || job.calendarHours[0];
-          const next = new Date(nowDate);
-          next.setHours(nextHour, 0, 0, 0);
-          if (nextHour <= currentHour) next.setDate(next.getDate() + 1);
-          nextRun = formatTime(next);
-        }
-        
-        jobs.push({
-          id: job.id,
-          name: job.name,
-          schedule: job.schedule,
-          status: isLoaded ? 'active' : 'stopped',
-          lastRun,
-          nextRun,
-          enabled: isLoaded
-        });
+      if (fs.existsSync(logFile)) {
+        const stat = fs.statSync(logFile);
+        lastRunMs = stat.mtime.getTime();
+        lastRun = formatTime(stat.mtime);
       }
-    } catch (e) {
-      console.error('Error reading launchd jobs:', e.message);
+    } catch (e) {}
+
+    let nextRun = '—';
+    if (job.intervalMs && lastRunMs) {
+      const nextMs = lastRunMs + job.intervalMs;
+      nextRun = nextMs > now ? formatTime(new Date(nextMs)) : 'soon';
+    } else if (job.calendarHour !== undefined) {
+      const next = new Date(nowDate);
+      next.setHours(job.calendarHour, 0, 0, 0);
+      if (next <= nowDate) next.setDate(next.getDate() + 1);
+      nextRun = formatTime(next);
+    } else if (job.calendarHours) {
+      const currentHour = nowDate.getHours();
+      const nextHour = job.calendarHours.find(h => h > currentHour) || job.calendarHours[0];
+      const next = new Date(nowDate);
+      next.setHours(nextHour, 0, 0, 0);
+      if (nextHour <= currentHour) next.setDate(next.getDate() + 1);
+      nextRun = formatTime(next);
     }
-    
-    cachedCronJobs = jobs;
+
+    jobs.push({ id: job.id, name: job.name, schedule: job.schedule, status: isLoaded ? 'active' : 'stopped', lastRun, nextRun, enabled: isLoaded });
   }
+  return jobs;
+}
+
+// Async cron refresh — uses exec (non-blocking) instead of execSync
+function refreshCronJobs(force = false) {
+  const now = Date.now();
+  if (!force && now - lastCronUpdate < 15000) return; // 15s debounce
+  if (cronRefreshInFlight) return;
+  lastCronUpdate = now;
+  cronRefreshInFlight = true;
+
+  exec('launchctl list 2>/dev/null || true', { encoding: 'utf8', timeout: 5000 }, (err, stdout) => {
+    cronRefreshInFlight = false;
+    const output = err ? '' : stdout;
+    cachedCronJobs = buildCronJobs(output);
+  });
+}
+
+// Synchronous getter — always returns cached data, triggers async refresh in background
+function getCronJobs(forceRefresh = false) {
+  refreshCronJobs(forceRefresh);
   return cachedCronJobs;
 }
 
@@ -759,7 +701,6 @@ setInterval(() => {
 }, 5000);
 
 // System stats and tokens change gradually — broadcast every 30s
-let sseTokenBroadcastTimer = null;
 async function broadcastTokensAndSystem() {
   if (sseClients.size === 0) return;
   try {
@@ -788,11 +729,12 @@ async function broadcastTokensAndSystem() {
 }
 setInterval(broadcastTokensAndSystem, 30000);
 
-// Broadcast cron updates every 15 seconds
+// Broadcast cron updates every 60s (launchd jobs don't change fast)
 setInterval(() => {
-  const cronJobs = getCronJobs(true);  // Force refresh
+  if (sseClients.size === 0) return;
+  const cronJobs = getCronJobs(true);
   broadcast('cron', cronJobs);
-}, 15000);
+}, 60000);
 
 // Start server
 app.listen(PORT, 'localhost', () => {

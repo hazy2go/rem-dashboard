@@ -1,13 +1,21 @@
 /**
  * Scan OpenClaw session logs for usage data
  * Extracts token counts and costs from JSONL session files
+ *
+ * Uses a TTL cache (5 min) to avoid re-reading all JSONL files on every request.
  */
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const readline = require('readline');
 
-const SESSIONS_DIR = path.join(process.env.HOME, '.openclaw/agents/main/sessions');
+const SESSIONS_DIR = path.join(os.homedir(), '.openclaw/agents/main/sessions');
+
+// --- Cache layer ---
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let todayCache = { data: null, expires: 0 };
+let weeklyCache = { data: null, expires: 0 };
 
 async function scanSessionFile(filePath) {
   const usage = {
@@ -53,29 +61,7 @@ async function scanSessionFile(filePath) {
   return usage;
 }
 
-async function getTodayUsage() {
-  const today = new Date().toISOString().split('T')[0];
-  const sessions = [];
-  
-  try {
-    const files = fs.readdirSync(SESSIONS_DIR);
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue;
-      
-      const filePath = path.join(SESSIONS_DIR, file);
-      const stats = fs.statSync(filePath);
-      const fileDate = stats.mtime.toISOString().split('T')[0];
-      
-      // Only include files modified today
-      if (fileDate === today) {
-        sessions.push(filePath);
-      }
-    }
-  } catch (e) {
-    console.error('Error listing sessions:', e.message);
-  }
-
-  // Aggregate usage from today's sessions
+async function scanAndAggregate(sessionPaths) {
   const totals = {
     inputTokens: 0,
     outputTokens: 0,
@@ -84,10 +70,10 @@ async function getTodayUsage() {
     totalTokens: 0,
     totalCost: 0,
     messageCount: 0,
-    sessionCount: sessions.length
+    sessionCount: sessionPaths.length
   };
 
-  for (const sessionPath of sessions) {
+  for (const sessionPath of sessionPaths) {
     const usage = await scanSessionFile(sessionPath);
     totals.inputTokens += usage.inputTokens;
     totals.outputTokens += usage.outputTokens;
@@ -101,50 +87,51 @@ async function getTodayUsage() {
   return totals;
 }
 
-async function getWeeklyUsage() {
-  const now = new Date();
-  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+function listSessionFiles(filter) {
   const sessions = [];
-  
   try {
     const files = fs.readdirSync(SESSIONS_DIR);
     for (const file of files) {
       if (!file.endsWith('.jsonl')) continue;
-      
       const filePath = path.join(SESSIONS_DIR, file);
       const stats = fs.statSync(filePath);
-      
-      // Include files from the last 7 days
-      if (stats.mtime >= weekAgo) {
+      if (filter(stats)) {
         sessions.push(filePath);
       }
     }
   } catch (e) {
     console.error('Error listing sessions:', e.message);
   }
+  return sessions;
+}
 
-  const totals = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    totalCost: 0,
-    messageCount: 0,
-    sessionCount: sessions.length
-  };
-
-  for (const sessionPath of sessions) {
-    const usage = await scanSessionFile(sessionPath);
-    totals.inputTokens += usage.inputTokens;
-    totals.outputTokens += usage.outputTokens;
-    totals.cacheRead += usage.cacheRead;
-    totals.cacheWrite += usage.cacheWrite;
-    totals.totalTokens += usage.totalTokens;
-    totals.totalCost += usage.totalCost;
-    totals.messageCount += usage.messageCount;
+async function getTodayUsage() {
+  const now = Date.now();
+  if (todayCache.data && now < todayCache.expires) {
+    return todayCache.data;
   }
 
+  const today = new Date().toISOString().split('T')[0];
+  const sessions = listSessionFiles((stats) => {
+    return stats.mtime.toISOString().split('T')[0] === today;
+  });
+
+  const totals = await scanAndAggregate(sessions);
+  todayCache = { data: totals, expires: now + CACHE_TTL_MS };
+  return totals;
+}
+
+async function getWeeklyUsage() {
+  const now = Date.now();
+  if (weeklyCache.data && now < weeklyCache.expires) {
+    return weeklyCache.data;
+  }
+
+  const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+  const sessions = listSessionFiles((stats) => stats.mtime >= weekAgo);
+
+  const totals = await scanAndAggregate(sessions);
+  weeklyCache = { data: totals, expires: now + CACHE_TTL_MS };
   return totals;
 }
 

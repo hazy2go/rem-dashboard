@@ -1,4 +1,29 @@
-import { useState, useEffect, useMemo, memo, useRef, useCallback } from "react";
+import { useState, useEffect, memo, useRef, useCallback, Component } from "react";
+
+// --- ERROR BOUNDARY ---
+// Prevents a single card crash from taking down the whole dashboard
+class CardErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    console.error(`[${this.props.label || 'Card'}] render error:`, error, info.componentStack);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="rem-card" style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 80, color: P.textMuted, fontSize: 14, fontStyle: "italic" }}>
+          {this.props.label || 'Section'} failed to render
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // --- PALETTE --- (Midnight Pastel Blue)
 const P = {
@@ -43,12 +68,14 @@ const PetalRing = memo(function PetalRing({ used, limit, label, size = 100 }) {
 
   const color = getColor(percentage);
   const softColor = percentage < 50 ? P.primaryPale : percentage < 75 ? P.warmSoft : P.accentSoft;
+  // Sanitize label for SVG filter ID (alphanumeric + dash only)
+  const filterId = `soft-glow-${label.replace(/[^a-zA-Z0-9-]/g, '')}`;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
         <defs>
-          <filter id={`soft-glow-${label}`}>
+          <filter id={filterId}>
             <feGaussianBlur stdDeviation="3" result="blur" />
             <feMerge>
               <feMergeNode in="blur" />
@@ -83,7 +110,7 @@ const PetalRing = memo(function PetalRing({ used, limit, label, size = 100 }) {
               fill={isActive ? color : P.primaryPale}
               opacity={isActive ? 0.8 : 0.3}
               style={{
-                filter: isActive ? `url(#soft-glow-${label})` : "none",
+                filter: isActive ? `url(#${filterId})` : "none",
                 transition: "all 0.6s ease",
               }}
             />
@@ -172,10 +199,15 @@ function SectionHeader({ emoji, title }) {
   );
 }
 
+// --- Scale constants (avoids sub-pixel rounding gaps) ---
+const SCALE = 1.1;
+const INNER_W = Math.round(1280 / SCALE);
+const INNER_H = Math.round(720 / SCALE);
+
 // --- MAIN DASHBOARD ---
 export default function RemDashboard() {
   const [time, setTime] = useState(new Date());
-  
+
   // Live data state
   const [tokens, setTokens] = useState({ sessionUsed: 0, sessionLimit: 0, weeklyUsed: 0, weeklyLimit: 0, costUsd: 0 });
   const [cronJobs, setCronJobs] = useState([]);
@@ -214,10 +246,12 @@ export default function RemDashboard() {
   useEffect(() => {
     let eventSource = null;
     let reconnectTimeout = null;
-    
+    let disposed = false;
+
     const connect = () => {
+      if (disposed) return;
       eventSource = new EventSource('http://localhost:3001/api/events');
-      
+
       eventSource.onopen = () => {
         console.log('SSE connected');
         setIsConnected(true);
@@ -234,15 +268,16 @@ export default function RemDashboard() {
           })
           .catch(() => {});
       };
-      
+
       eventSource.onerror = () => {
         console.log('SSE error, reconnecting...');
         setIsConnected(false);
         eventSource.close();
-        // Reconnect after 2 seconds
+        // Clear any pending reconnect to prevent stacking
+        clearTimeout(reconnectTimeout);
         reconnectTimeout = setTimeout(connect, 2000);
       };
-      
+
       // Activity updates (instant from rem-log)
       eventSource.addEventListener('activity', (e) => {
         try {
@@ -250,7 +285,7 @@ export default function RemDashboard() {
           setActivity(data);
         } catch (err) {}
       });
-      
+
       // Agent state updates (instant from rem-task)
       eventSource.addEventListener('agent', (e) => {
         try {
@@ -258,7 +293,7 @@ export default function RemDashboard() {
           setMainAgent(prev => ({ ...prev, ...data }));
         } catch (err) {}
       });
-      
+
       // Cron job updates
       eventSource.addEventListener('cron', (e) => {
         try {
@@ -296,12 +331,13 @@ export default function RemDashboard() {
         setIsConnected(true);
       });
     };
-    
+
     connect();
-    
+
     return () => {
+      disposed = true;
       if (eventSource) eventSource.close();
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      clearTimeout(reconnectTimeout);
     };
   }, []);
 
@@ -351,14 +387,14 @@ export default function RemDashboard() {
     }}>
     {/* Scaled content wrapper - 10% larger elements */}
     <div style={{
-      width: Math.floor(1280 / 1.1),
-      height: Math.floor(720 / 1.1),
-      transform: "scale(1.1)",
+      width: INNER_W,
+      height: INNER_H,
+      transform: `scale(${SCALE})`,
       transformOrigin: "top left",
       position: "relative",
       overflow: "hidden",
     }}>
-      <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Comfortaa:wght@400;600;700&display=swap" rel="stylesheet" />
+      {/* Google Fonts now loaded from index.html — no inline <link> */}
 
       <style>{`
         @keyframes gentlePulse {
@@ -500,6 +536,7 @@ export default function RemDashboard() {
         <div style={{ display: "flex", flexDirection: "column", gap: 12, overflow: "hidden" }}>
 
           {/* TOKEN PETALS */}
+          <CardErrorBoundary label="Token Usage">
           <div className="rem-card" style={{ flex: "0 0 auto" }}>
             <SectionHeader emoji="✿" title="Token Usage" />
             <div style={{ display: "flex", justifyContent: "center", gap: 12, padding: "2px 0" }}>
@@ -524,8 +561,10 @@ export default function RemDashboard() {
               </div>
             )}
           </div>
+          </CardErrorBoundary>
 
           {/* PRIMARY AGENT */}
+          <CardErrorBoundary label="Primary Agent">
           <div className="rem-card" style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <SectionHeader emoji="🤖" title="Primary" />
             <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 8 }}>
@@ -567,12 +606,14 @@ export default function RemDashboard() {
               <span>Tasks completed: <span style={{ color: P.primary, fontWeight: 700 }}>{mainAgent.tasksCompleted}</span></span>
             </div>
           </div>
+          </CardErrorBoundary>
         </div>
 
         {/* CENTER — CRON + ACTIVITY */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12, overflow: "hidden" }}>
 
           {/* CRON JOBS */}
+          <CardErrorBoundary label="Cron Jobs">
           <div className="rem-card" style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <SectionHeader emoji="⏰" title="Cron Jobs" />
             <div style={{ flex: 1, overflow: "auto" }}>
@@ -591,10 +632,10 @@ export default function RemDashboard() {
                 <span>Next</span>
               </div>
               {cronJobs.length === 0 ? (
-                <div style={{ 
-                  textAlign: 'center', 
-                  color: P.textMuted, 
-                  fontSize: 14, 
+                <div style={{
+                  textAlign: 'center',
+                  color: P.textMuted,
+                  fontSize: 14,
                   padding: '20px',
                   fontStyle: 'italic'
                 }}>
@@ -619,8 +660,10 @@ export default function RemDashboard() {
               )}
             </div>
           </div>
+          </CardErrorBoundary>
 
           {/* ACTIVITY FEED */}
+          <CardErrorBoundary label="Activity Feed">
           <div className="rem-card" style={{ flex: 1.3, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <SectionHeader emoji="📋" title="Activity Feed" />
             <div style={{ flex: 1, overflow: "auto", fontSize: 13, lineHeight: 1.7 }}>
@@ -640,10 +683,10 @@ export default function RemDashboard() {
                 const timestamp = formatActivityTime(entry.t || entry.timestamp);
                 const message = entry.msg || entry.message;
                 return (
-                  <div key={i} style={{ 
-                    padding: '8px 10px', 
-                    marginBottom: 6, 
-                    background: 'rgba(40,60,95,0.5)', 
+                  <div key={i} style={{
+                    padding: '8px 10px',
+                    marginBottom: 6,
+                    background: 'rgba(40,60,95,0.5)',
                     borderRadius: 8,
                     borderLeft: `3px solid ${typeColor[entry.type] || P.primary}`
                   }}>
@@ -658,17 +701,19 @@ export default function RemDashboard() {
               })}
             </div>
           </div>
+          </CardErrorBoundary>
         </div>
 
         {/* RIGHT — SUBAGENTS */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12, overflow: "hidden" }}>
+          <CardErrorBoundary label="Sub-Agents">
           <div className="rem-card" style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <SectionHeader emoji="🫧" title="Sub-Agents" />
             <div style={{ display: "flex", flexDirection: "column", gap: 9, flex: 1, overflow: "auto" }}>
               {(!subAgents || subAgents.length === 0) && (
-                <div style={{ 
-                  fontSize: 12, color: P.textMuted, textAlign: "center", 
-                  padding: 16, fontStyle: "italic" 
+                <div style={{
+                  fontSize: 12, color: P.textMuted, textAlign: "center",
+                  padding: 16, fontStyle: "italic"
                 }}>
                   No sub-agents active ✨
                 </div>
@@ -732,6 +777,7 @@ export default function RemDashboard() {
               <span>Total: <span style={{ color: P.text, fontWeight: 700 }}>{subAgents ? subAgents.length : 0}</span></span>
             </div>
           </div>
+          </CardErrorBoundary>
         </div>
       </div>
 

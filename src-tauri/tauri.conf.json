@@ -23,10 +23,10 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src http://localhost:3001; img-src 'self' data:"
     }
   },
   "bundle": {
-    "active": false
+    "active": true
   }
 }
